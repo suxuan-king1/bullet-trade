@@ -331,8 +331,8 @@ def test_helper_order_target_value_accepts_value_alias_for_market_sell():
 
     action, payload = next(item for item in client.requests if item[0] == "broker.place_order")
     assert action == "broker.place_order"
-    assert payload["side"] == "SELL"
-    assert payload["amount"] == 300
+    assert payload["target_amount"] == 0
+    assert payload["amount"] == 1
     assert payload["wait_timeout"] == 5
     assert payload["market"] is True
     assert payload["style"] == {"type": "market"}
@@ -480,10 +480,10 @@ def test_helper_order_target_without_price_sends_market_delta_payloads():
 
     place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
     assert place_orders[0]["side"] == "BUY"
-    assert place_orders[0]["amount"] == 200
+    assert place_orders[0]["target_amount"] == 500
     assert place_orders[0]["style"] == {"type": "market"}
-    assert place_orders[1]["side"] == "SELL"
-    assert place_orders[1]["amount"] == 200
+    assert place_orders[1]["side"] == "BUY"
+    assert place_orders[1]["target_amount"] == 100
     assert place_orders[1]["style"] == {"type": "market"}
 
 
@@ -497,7 +497,7 @@ def test_helper_order_target_value_without_price_sends_market_buy_payload():
     action, payload = client.requests[-1]
     assert action == "broker.place_order"
     assert payload["side"] == "BUY"
-    assert payload["amount"] == 200
+    assert payload["target_amount"] == 500
     assert payload["market"] is True
     assert payload["style"] == {"type": "market"}
 
@@ -537,7 +537,7 @@ def test_helper_direct_percent_orders_use_remote_total_value():
     assert place_orders[-2]["amount"] == 1234
     assert place_orders[-2]["wait_timeout"] == 0
     assert place_orders[-1]["side"] == "BUY"
-    assert place_orders[-1]["amount"] == 317
+    assert place_orders[-1]["target_amount"] == 617
     assert place_orders[-1]["wait_timeout"] == 0
 
 
@@ -598,7 +598,7 @@ def test_install_jq_compat_uses_remote_portfolio_and_default_wait(monkeypatch):
     assert order.order_id == "oid-compat"
     place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
     assert place_orders[-1]["side"] == "BUY"
-    assert place_orders[-1]["amount"] == 200
+    assert place_orders[-1]["target_amount"] == 500
     assert place_orders[-1]["wait_timeout"] == 16.0
     assert place_orders[-1]["style"] == {"type": "market"}
 
@@ -624,7 +624,7 @@ def test_install_jq_compat_percent_orders_use_remote_total_value(monkeypatch):
     assert order.is_buy is True
     place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
     assert place_orders[-2]["side"] == "BUY"
-    assert place_orders[-2]["amount"] == 317
+    assert place_orders[-2]["target_amount"] == 617
     assert place_orders[-2]["wait_timeout"] == 16.0
     assert place_orders[-1]["side"] == "SELL"
     assert place_orders[-1]["amount"] == 123

@@ -100,6 +100,8 @@ class RiskController:
         security: Optional[str] = None,
         total_value: Optional[float] = None,
         action: str = "buy",
+        current_position_value: float = 0.0,
+        pending_buy_value: float = 0.0,
     ) -> bool:
         """
         检查订单是否符合风控规则
@@ -166,7 +168,7 @@ class RiskController:
 
         # 6. 检查单只股票仓位（如果提供了总资产）
         if action == "buy" and total_value is not None and total_value > 0:
-            position_ratio = (order_value / total_value) * 100
+            position_ratio = ((current_position_value + pending_buy_value + order_value) / total_value) * 100
             if position_ratio > self.config["max_position_ratio"]:
                 self.stats.rejected_orders += 1
                 raise ValueError(

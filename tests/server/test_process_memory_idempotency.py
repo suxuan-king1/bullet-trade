@@ -386,8 +386,8 @@ async def test_multiple_virtual_accounts_share_one_process_cache() -> None:
 
     assert len(broker.place_calls) == 2
     assert {row["sub_account_id"] for row in broker.place_calls} == {
-        "b4-a@default",
-        "b4-b@default",
+        "b4-a",
+        "b4-b",
     }
     assert len(app._idempotency_cache) == 2
 

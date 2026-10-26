@@ -26,6 +26,7 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+from bullet_trade.core.pricing import compute_market_protect_price
 
 from bullet_trade.data.qmt_adjustment import (
     AdjustmentError,
@@ -33,7 +34,7 @@ from bullet_trade.data.qmt_adjustment import (
     aggregate_bars,
     parse_frequency,
 )
-from bullet_trade.utils.env_loader import get_env, get_env_float
+from bullet_trade.utils.env_loader import get_env, get_env_float, get_live_trade_config
 
 from ..config import ServerConfig
 from . import register_adapter
@@ -1385,6 +1386,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
     """通过大 QMT HTTP Gateway 提供账户查询、下单、撤单和订单对账。"""
 
     tracks_broker_call_boundary = True
+    durable_submissions = True
 
     def __init__(
         self,
@@ -1468,13 +1470,88 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         data = await self.client.post("/order_status", payload)
         return self._apply_local_order_tag(_normalize_order(_extract_dict(data)))
 
-    async def place_order(self, account: AccountContext, payload: Dict) -> Dict:
+    def _submission_request(self, account: AccountContext, payload: Dict) -> Dict:
+        """构造真实账户绑定的稳定提交身份，不修改调用方载荷。"""
         request = dict(payload or {})
         request.update(self._account_payload(account))
         _ensure_virtual_account_remark(request)
         _ensure_gateway_submission_identity(request)
         _apply_big_qmt_market_price_type(request)
-        submitted_at = time.time()
+        style = request.get("style") or {}
+        native_types = (request.get("pr_type"), request.get("prType"), style.get("pr_type"), style.get("prType"))
+        request["pr_type"] = next((int(value) for value in native_types if value is not None), 11)
+        execution_price = _request_order_price(request)
+        if execution_price is not None:
+            request["price"] = float(execution_price)
+        if _request_is_market_order(request) and not _request_order_price(request):
+            request["_auto_price"] = True
+        return request
+
+    async def prepare_order(self, account: AccountContext, payload: Dict) -> Dict:
+        """持久化执行参数并返回原任务；此阶段不调用原生下单接口。"""
+        health = await self.client.health()
+        if health.get("submission_protocol") != "durable-submissions/v1":
+            raise BigQmtGatewayError("请先升级 QMT 网关：需要持久化幂等协议", code="SUBMISSION_PROTOCOL_REQUIRED", broker_called=False)
+        request = self._submission_request(account, payload)
+        existing = await self.client.post("/resolve_submission", {
+            **self._account_payload(account), "sub_account_id": request.get("sub_account_id"),
+            "idempotency_key": request["idempotency_key"], "request_payload": request,
+        })
+        if existing.get("submission_state") != "not_found":
+            return existing
+        if request.get("_auto_price"):
+            snapshot = await BigQmtDataAdapter(self.client).get_live_current({"security": request["security"]})
+            last = float(snapshot.get("last_price") or snapshot.get("lastPrice") or 0)
+            stamp = snapshot.get("time") or snapshot.get("datetime") or snapshot.get("timestamp") or snapshot.get("dt") or snapshot.get("source_time") or snapshot.get("source_event_time")
+            epoch = _parse_order_timestamp(stamp)
+            if not math.isfinite(last) or last <= 0 or epoch is None or not -5 <= time.time() - epoch <= 60:
+                raise BigQmtGatewayError("市价单需要 60 秒内有效行情及行情时间", code="STALE_QUOTE", broker_called=False)
+            if snapshot.get("paused"):
+                raise BigQmtGatewayError("证券已停牌", code="SECURITY_PAUSED", broker_called=False)
+            pricing_config = get_live_trade_config()
+            request["_market_prices"] = {
+                side: compute_market_protect_price(request["security"], last,
+                    snapshot.get("high_limit") or snapshot.get("upper_limit"),
+                    snapshot.get("low_limit") or snapshot.get("lower_limit"),
+                    float(pricing_config.get("market_buy_price_percent", 0.015) if side == "BUY" else pricing_config.get("market_sell_price_percent", -0.015)), side == "BUY")
+                for side in ("BUY", "SELL")
+            }
+            request["price"] = request["_market_prices"][request["side"]]
+            request["style"] = dict(request.get("style") or {}, protect_price=request["price"])
+        return await self.client.post("/prepare_submission", request)
+
+    async def reject_prepared_order(self, account: AccountContext, payload: Dict, reason: str) -> Dict:
+        return await self.client.post("/reject_submission", {
+            **self._account_payload(account), "sub_account_id": payload.get("sub_account_id"),
+            "idempotency_key": payload["idempotency_key"], "reason": reason,
+        })
+
+    async def submission_reservations(self, account: AccountContext) -> List[Dict]:
+        return await self.client.post("/submission_reservations", self._account_payload(account))
+
+    async def resolve_submission(self, account: AccountContext, payload: Dict) -> Dict:
+        """按持久化身份对账，不重新调用 passorder。"""
+        if payload.get("write_action") != "broker.place_order":
+            return {}
+        original = payload.get("request_payload") or {}
+        request = self._submission_request(account, dict(original, idempotency_key=payload["idempotency_key"])) if original else {}
+        result = await self.client.post("/resolve_submission", {
+            **self._account_payload(account), "idempotency_key": payload["idempotency_key"],
+            "sub_account_id": payload.get("sub_account_id") or original.get("sub_account_id"),
+            "request_payload": request,
+        })
+        return _normalize_order(result)
+
+    async def place_order(self, account: AccountContext, payload: Dict) -> Dict:
+        if not payload.get("_prepared"):
+            prepared = await self.prepare_order(account, payload)
+            if prepared.get("submission_state") != "prepared":
+                return _normalize_order(prepared)
+            request = dict(prepared["execution"])
+            mark_broker_call_started(payload)
+        else:
+            request = dict(payload)
+        submitted_at = request.get("_created_at", time.time())
         wait_timeout = _positive_float((payload or {}).get("wait_timeout"))
         known_order_ids = set()
         if wait_timeout > 0:
@@ -1517,9 +1594,16 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
                     )
                     continue
                 confirmed = dict(matched)
+                if request.get("_prepared"):
+                    await self.client.post("/resolve_submission", {
+                        **self._account_payload(account),
+                        "sub_account_id": request.get("sub_account_id"),
+                        "idempotency_key": request["idempotency_key"],
+                    })
                 self._remember_local_order_tag(confirmed.get("order_id"), request)
                 confirmed = self._apply_local_order_tag(confirmed)
                 for key in (
+                    "_replayed",
                     "order_ref",
                     "passorder_return",
                     "passorder_return_type",
@@ -2100,13 +2184,17 @@ def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
         None。
 
     Side Effects:
-        将显式标识或幂等键 SHA-256 摘要收敛为 QMT 支持的 23 字符，
+        校验显式标识长度，或由账户、子账户及幂等键派生 23 字符标识，
         禁止依赖证券/价格/数量等经济字段。
     """
 
+    if not payload.get("idempotency_key"):
+        payload["idempotency_key"] = f"big-qmt-direct-{uuid4().hex}"
     existing = str(payload.get("qmt_user_order_id") or "").strip()
     if existing:
-        payload["qmt_user_order_id"] = existing[:_QMT_USER_ORDER_ID_MAX_LENGTH]
+        if len(existing) > _QMT_USER_ORDER_ID_MAX_LENGTH:
+            raise ValueError("qmt_user_order_id 超过长度限制")
+        payload["qmt_user_order_id"] = existing
         return
     idempotency_key = str(payload.get("idempotency_key") or "").strip()
     if not idempotency_key:
@@ -2115,7 +2203,8 @@ def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
         idempotency_key = f"big-qmt-direct-{uuid4().hex}"
         payload["idempotency_key"] = idempotency_key
     digest_length = _QMT_USER_ORDER_ID_MAX_LENGTH - len("BT-")
-    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:digest_length]
+    scope = json.dumps([payload.get("account_id"), payload.get("account_type"), _virtual_account_id(payload), idempotency_key], ensure_ascii=True)
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:digest_length]
     payload["qmt_user_order_id"] = f"BT-{digest}"
 
 

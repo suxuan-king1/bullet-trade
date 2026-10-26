@@ -16,6 +16,7 @@ from logging.handlers import TimedRotatingFileHandler
 import math
 import os
 import queue
+import sqlite3
 import re
 import sys
 import threading
@@ -44,7 +45,9 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260908_dividend_facts_v1"
+GATEWAY_BUILD_ID = "20261026_durable_submissions_v1"
+SUBMISSION_STORE_PATH = None
+SUBMISSION_PROTOCOL = "durable-submissions/v1"
 
 # 除权事实协议版本；仅说明字段格式，不证明本地事件已下载完整或算法验收通过。
 DIVIDEND_EVENT_SCHEMA = "big-qmt-dividend-events/v1"
@@ -123,8 +126,6 @@ ORDER_TAG_MATCH_TTL_SECONDS = 24 * 60 * 60
 MAX_ORDER_TAGS = 5000
 
 # Call passorder with the official userOrderId/investment-remark argument first.
-# If the broker build only supports the article-compatible signature, the helper
-# catches TypeError and falls back automatically.
 PASSORDER_USE_REMARK_SIGNATURE = True
 
 # passorder quickTrade argument. The article sample uses 2. If passorder returns
@@ -1608,15 +1609,19 @@ def _row_identity(row: Any, fallback_prefix: str) -> str:
 def _merge_trade_detail_rows(account_id: str, account_type: str, detail_types: List[str], sources: List[Optional[str]]) -> List[Any]:
     rows = []
     seen = set()
+    succeeded = False
     for detail_type in detail_types:
         for source in sources:
             result = _try_trade_detail(account_id, account_type, detail_type, source)
+            succeeded = succeeded or result["ok"]
             for row in result["rows"]:
                 key = detail_type + "|" + _row_identity(row, "row")
                 if key in seen:
                     continue
                 seen.add(key)
                 rows.append(row)
+    if not succeeded:
+        raise RuntimeError("All order/trade queries failed")
     return rows
 
 
@@ -2329,72 +2334,18 @@ def _call_passorder(
     context_info: Any,
     quick_trade: int,
 ) -> Dict[str, Any]:
-    fallback_error = None
-    if PASSORDER_USE_REMARK_SIGNATURE and qmt_user_order_id:
-        try:
-            order_ref = passer(
-                op_type,
-                1101,
-                account_id,
-                qmt_security,
-                pr_type,
-                float(price),
-                amount,
-                strategy_name,
-                quick_trade,
-                qmt_user_order_id,
-                context_info,
-            )
-            return {
-                "order_ref": order_ref,
-                "passorder_signature": "official_user_order_id",
-                "qmt_user_order_id": qmt_user_order_id,
-                "fallback_error": None,
-            }
-        except TypeError as exc:
-            fallback_error = str(exc)
-            _emit("warning", "passorder with remark signature failed; fallback to article signature error=%s", exc)
-    remark_or_strategy = strategy_name or "qmt"
-    try:
-        order_ref = passer(
-            op_type,
-            1101,
-            account_id,
-            qmt_security,
-            pr_type,
-            float(price),
-            amount,
-            remark_or_strategy,
-            quick_trade,
-            context_info,
-        )
-        return {
-            "order_ref": order_ref,
-            "passorder_signature": "article",
-            "qmt_user_order_id": qmt_user_order_id or "",
-            "fallback_error": fallback_error,
-        }
-    except TypeError:
-        if remark_or_strategy != strategy_name:
-            order_ref = passer(
-                op_type,
-                1101,
-                account_id,
-                qmt_security,
-                pr_type,
-                float(price),
-                amount,
-                strategy_name,
-                quick_trade,
-                context_info,
-            )
-            return {
-                "order_ref": order_ref,
-                "passorder_signature": "article_strategy_name",
-                "qmt_user_order_id": qmt_user_order_id or "",
-                "fallback_error": fallback_error,
-            }
-        raise
+    if not PASSORDER_USE_REMARK_SIGNATURE or not qmt_user_order_id:
+        raise ValueError("Trading requires the verified userOrderId passorder signature")
+    order_ref = passer(
+        op_type, 1101, account_id, qmt_security, pr_type, float(price), amount,
+        strategy_name, quick_trade, qmt_user_order_id, context_info,
+    )
+    return {
+        "order_ref": order_ref,
+        "passorder_signature": "official_user_order_id",
+        "qmt_user_order_id": qmt_user_order_id,
+        "fallback_error": None,
+    }
 
 
 def _request_quick_trade(payload: Dict[str, Any]) -> int:
@@ -2425,7 +2376,273 @@ def _ensure_context_account(context_info: Any, account_id: str) -> None:
         _emit("warning", "ContextInfo.accountID before passorder assign failed account=%s error=%s", account_id, exc)
 
 
-def _place_order(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _submission_db():
+    path = SUBMISSION_STORE_PATH or (_order_tag_store_path() + ".sqlite3")
+    connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute("CREATE TABLE IF NOT EXISTS submissions (account TEXT, sub TEXT, key TEXT, fingerprint TEXT NOT NULL, request TEXT NOT NULL, state TEXT NOT NULL, result TEXT, PRIMARY KEY(account, sub, key))")
+    return connection
+
+
+def _submission_identity(payload):
+    account = _resolve_account(payload)
+    key = str(payload.get("idempotency_key") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,254}", key):
+        raise ValueError("A stable idempotency_key is required")
+    return (account["account_type"] + ":" + account["account_id"], _resolve_virtual_account_id(payload), key)
+
+
+def _submission_fingerprint(payload):
+    fields = ("security", "side", "amount", "price", "style", "pr_type", "market_type", "target_amount", "qmt_user_order_id", "quick_trade", "strategy_name", "order_remark", "_auto_price")
+    value = {field: payload.get(field) for field in fields}
+    if payload.get("_auto_price"):
+        value["price"] = None
+        value["style"] = dict(value.get("style") or {})
+        value["style"].pop("protect_price", None)
+    if payload.get("target_amount") is not None:
+        value["side"] = None
+        value["amount"] = None
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False)
+
+
+def _submission_row(connection, identity):
+    return connection.execute("SELECT * FROM submissions WHERE account=? AND sub=? AND key=?", identity).fetchone()
+
+
+def _submission_evidence(request):
+    account = _resolve_account(request)
+    orders = _query_orders(account["account_id"], account["account_type"], {})
+    matches = []
+    for order in orders:
+        if not _order_matches_tag(order, request):
+            continue
+        if str(order.get("qmt_user_order_id") or "") != request.get("qmt_user_order_id"):
+            continue
+        if order.get("security") != request.get("security") or int(order.get("amount") or 0) != request.get("amount"):
+            continue
+        raw = order.get("raw") or {}
+        side = str(order.get("side") or {23: "BUY", 24: "SELL"}.get(raw.get("m_nOpType"), "")).upper()
+        if side != request.get("side"):
+            continue
+        if order.get("sub_account_id") and order["sub_account_id"] != request.get("sub_account_id", ""):
+            continue
+        if int(request.get("pr_type", 11)) == 11 and not _float_close(order.get("order_price"), request.get("price")):
+            continue
+        matches.append(order)
+    if len(matches) != 1:
+        return None
+    result = dict(matches[0])
+    result.update(sub_account_id=request.get("sub_account_id", ""), side=request["side"])
+    result["status"] = {54: "partly_canceled", 55: "cancelled", 56: "filled", 57: "rejected"}.get(result.get("raw_status"), "open")
+    return result
+
+
+def _submission_result(row, connection=None):
+    request = json.loads(row["request"])
+    if row["state"] in ("submitting", "unknown", "accepted", "settled"):
+        try:
+            evidence = _submission_evidence(request)
+        except Exception:
+            evidence = None
+        if evidence:
+            result = dict(evidence, submission_state="accepted", idempotency_key=row["key"], _replayed=True)
+            owned = connection is None
+            connection = connection or _submission_db()
+            try:
+                connection.execute("UPDATE submissions SET state=?, result=? WHERE account=? AND sub=? AND key=?", ("settled" if row["state"] == "settled" else "accepted", json.dumps(result), row["account"], row["sub"], row["key"]))
+            finally:
+                if owned:
+                    connection.close()
+            return result
+    result = json.loads(row["result"]) if row["result"] else {}
+    if row["state"] in ("submitting", "unknown"):
+        result.update(status="submit_unknown", submit_unknown=True)
+    result.update(idempotency_key=row["key"], execution=request, submission_state=row["state"], _replayed=True)
+    return result
+
+
+def _position_amount(positions, security):
+    return sum(int(position.get("amount") or 0) for position in positions if position.get("security") == security)
+
+
+def _submission_settled(request, positions):
+    evidence = _submission_evidence(request)
+    if not evidence or evidence.get("status") not in ("filled", "cancelled", "partly_canceled", "rejected"):
+        return False
+    change = int(evidence.get("filled") or 0) * (1 if request["side"] == "BUY" else -1)
+    expected = request["_baseline_amount"] + change
+    return _position_amount(positions, request["security"]) == expected
+
+
+def _submission_payload(payload):
+    payload = dict(payload)
+    identity = _submission_identity(payload)
+    style = payload.get("style") or {}
+    payload["security"] = _from_qmt_security(_to_qmt_security(str(payload.get("security") or payload.get("stock") or payload.get("stockcode") or "")))
+    payload["amount"] = payload.get("amount", payload.get("volume", 0))
+    payload["side"] = str(payload.get("side") or "").strip().upper()
+    if payload.get("price") is None:
+        payload["price"] = style.get("price", style.get("protect_price"))
+    if payload.get("price") is not None:
+        payload["price"] = float(payload["price"])
+    native_types = (payload.get("pr_type"), payload.get("prType"), style.get("pr_type"), style.get("prType"))
+    payload["pr_type"] = next((int(value) for value in native_types if value is not None), 11)
+    if not payload.get("qmt_user_order_id"):
+        account = _resolve_account(payload)
+        scope = json.dumps([account["account_id"], account["account_type"], identity[1], identity[2]], ensure_ascii=True)
+        payload["qmt_user_order_id"] = "BT-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:20]
+    if len(str(payload["qmt_user_order_id"])) > QMT_USER_ORDER_ID_MAX_LENGTH:
+        raise ValueError("Customer identifier exceeds supported length")
+    return payload
+
+
+def _prepare_submission(context_info, payload):
+    payload = _submission_payload(payload)
+    identity = _submission_identity(payload)
+    fingerprint = _submission_fingerprint(payload)
+    connection = _submission_db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = _submission_row(connection, identity)
+        if row:
+            if row["fingerprint"] != fingerprint:
+                raise ValueError("IDEMPOTENCY_CONFLICT")
+            result = _submission_result(row, connection)
+            connection.commit()
+            return result
+        if not ENABLE_TRADING or context_info is None or not PASSORDER_USE_REMARK_SIGNATURE:
+            raise ValueError("Trading unavailable or userOrderId signature not configured")
+        account = _resolve_account(payload)
+        if _is_placeholder_account_id(account["account_id"]):
+            raise ValueError("Account not configured")
+        request = dict(payload)
+        request["_created_at"] = time.time()
+        request["quick_trade"] = _request_quick_trade(payload)
+        for previous in connection.execute("SELECT request FROM submissions WHERE account=?", (identity[0],)).fetchall():
+            if json.loads(previous["request"]).get("qmt_user_order_id") == request.get("qmt_user_order_id"):
+                raise ValueError("IDEMPOTENCY_CONFLICT: customer identifier already used")
+        positions = _query_positions(account["account_id"], account["account_type"])
+        request["_baseline_amount"] = _position_amount(positions, request["security"])
+        target = request.get("target_amount")
+        if target is not None:
+            if identity[1]:
+                raise ValueError("Target orders require a real-account position ledger; virtual targets are unsupported")
+            if int(target) != target or target < 0:
+                raise ValueError("target_amount must be a nonnegative integer")
+            for previous in connection.execute("SELECT * FROM submissions WHERE account=?", (identity[0],)).fetchall():
+                old = json.loads(previous["request"])
+                if old.get("security") == request["security"] and previous["state"] not in ("rejected", "no_op", "settled"):
+                    if not _submission_settled(old, positions):
+                        raise ValueError("TARGET_PENDING: reconcile existing submission first")
+                    _submission_result(previous, connection)
+                    connection.execute("UPDATE submissions SET state='settled' WHERE account=? AND sub=? AND key=?", (previous["account"], previous["sub"], previous["key"]))
+            orders = _query_orders(account["account_id"], account["account_type"], {})
+            if any(order.get("security") == request["security"] and order.get("raw_status") not in (54, 55, 56, 57) for order in orders):
+                raise ValueError("TARGET_PENDING: working order exists")
+            delta = target - request["_baseline_amount"]
+            request.update(amount=abs(delta), side="BUY" if delta >= 0 else "SELL")
+        if request.get("_auto_price") and request.get("_market_prices"):
+            request["price"] = request["_market_prices"][request["side"]]
+            request["style"] = dict(request.get("style") or {}, protect_price=request["price"])
+        amount = float(request.get("amount") or 0)
+        price = float(request.get("price") or 0)
+        if not math.isfinite(amount) or not amount.is_integer() or amount < 0 or (target is None and amount == 0):
+            raise ValueError("amount must be a positive integer")
+        if request.get("side") not in ("BUY", "SELL") or not math.isfinite(price) or price <= 0:
+            raise ValueError("Invalid side or price")
+        style = request.get("style") or {}
+        if str(style.get("type") or "").lower() == "market" and request["pr_type"] == 11:
+            raise ValueError("Market intent requires an explicit native market price type")
+        if any(float(value) != price for value in (style.get("price"), style.get("protect_price")) if value is not None):
+            raise ValueError("Conflicting execution prices")
+        request["amount"] = int(amount)
+        request["sub_account_id"] = identity[1]
+        request["_prepared"] = True
+        state = "no_op" if amount == 0 else "prepared"
+        result = {"status": "no_op", "order_id": ""} if state == "no_op" else {}
+        connection.execute("INSERT INTO submissions VALUES (?, ?, ?, ?, ?, ?, ?)", identity + (fingerprint, json.dumps(request, allow_nan=False), state, json.dumps(result)))
+        connection.commit()
+        return _submission_result(_submission_row(connection, identity))
+    finally:
+        connection.close()
+
+
+def _resolve_submission(payload):
+    connection = _submission_db()
+    try:
+        row = _submission_row(connection, _submission_identity(payload))
+        if not row:
+            return {"status": "submit_unknown", "submit_unknown": True, "submission_state": "not_found"}
+        original = payload.get("request_payload")
+        if original and _submission_fingerprint(_submission_payload(original)) != row["fingerprint"]:
+            raise ValueError("IDEMPOTENCY_CONFLICT")
+        return _submission_result(row)
+    finally:
+        connection.close()
+
+
+def _submission_reservations(payload):
+    connection = _submission_db()
+    try:
+        account = _resolve_account(payload)
+        account_key = account["account_type"] + ":" + account["account_id"]
+        positions = _query_positions(account["account_id"], account["account_type"])
+        result = []
+        for row in connection.execute("SELECT * FROM submissions WHERE account=?", (account_key,)).fetchall():
+            if row["state"] in ("rejected", "no_op", "settled"):
+                continue
+            request = json.loads(row["request"])
+            if row["state"] != "prepared" and _submission_settled(request, positions):
+                continue
+            result.append(request)
+        return result
+    finally:
+        connection.close()
+
+
+def _place_order(context_info, payload):
+    started = False
+    try:
+        if not payload.get("_prepared"):
+            prepared = _prepare_submission(context_info, payload)
+            if prepared.get("submission_state") != "prepared":
+                return _ok(prepared, payload.get("request_id"))
+            payload = prepared["execution"]
+        identity = _submission_identity(payload)
+        connection = _submission_db()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = _submission_row(connection, identity)
+            if not row:
+                raise ValueError("Submission not prepared")
+            request = json.loads(row["request"])
+            if _submission_fingerprint(payload) != _submission_fingerprint(request):
+                raise ValueError("IDEMPOTENCY_CONFLICT")
+            if row["state"] != "prepared":
+                result = _submission_result(row, connection)
+                connection.commit()
+                return _ok(result, payload.get("request_id"))
+            connection.execute("UPDATE submissions SET state='submitting' WHERE account=? AND sub=? AND key=?", identity)
+            connection.commit()
+            started = True
+            response = _place_order_native(context_info, request)
+            result = response.get("value") or {}
+            if not response.get("ok"):
+                result = {"status": "submit_unknown", "submit_unknown": True, "warning": response.get("message")}
+            connection.execute("UPDATE submissions SET state='unknown', result=? WHERE account=? AND sub=? AND key=? AND state='submitting'", (json.dumps(result),) + identity)
+            return _ok(dict(result, execution=request), payload.get("request_id"))
+        finally:
+            connection.close()
+    except (ValueError, sqlite3.Error) as exc:
+        if started:
+            return _ok({"status": "submit_unknown", "submit_unknown": True, "idempotency_key": payload.get("idempotency_key")}, payload.get("request_id"))
+        response = _error("IDEMPOTENCY_CONFLICT" if "IDEMPOTENCY_CONFLICT" in str(exc) else "SUBMISSION_REJECTED", str(exc), payload.get("request_id"))
+        response["broker_called"] = False
+        return response
+
+
+def _place_order_native(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     request_id = payload.get("request_id")
     if not ENABLE_TRADING:
         return _error("TRADING_DISABLED", "trading is disabled", request_id)
@@ -2444,13 +2661,15 @@ def _place_order(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         price = style.get("price") or style.get("protect_price")
     if not security or amount <= 0 or price is None:
         return _error("BAD_REQUEST", "place_order requires security, amount and price", request_id)
-    pr_type = int(payload.get("pr_type") or payload.get("prType") or style.get("pr_type") or style.get("prType") or 11)
+    pr_type = next((int(value) for value in (payload.get("pr_type"), payload.get("prType"), style.get("pr_type"), style.get("prType")) if value is not None), 11)
+    if side not in ("BUY", "SELL"):
+        return _error("BAD_REQUEST", "side must be BUY or SELL", request_id)
     op_type = 23 if side == "BUY" else 24
     strategy_name = str(payload.get("strategy_name") or payload.get("strategy") or "qmt")
     order_remark = _compose_order_remark(payload)
     qmt_user_order_id = _compose_qmt_user_order_id(payload, order_remark)
     virtual_account_id = _resolve_virtual_account_id(payload)
-    quick_trade = _request_quick_trade(payload)
+    quick_trade = int(payload["quick_trade"]) if payload.get("_prepared") else _request_quick_trade(payload)
     _ensure_context_account(context_info, account["account_id"])
     _emit(
         "info",
@@ -2610,7 +2829,7 @@ def _cancel_order(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
         sub_account_id = _resolve_virtual_account_id(payload)
         if sub_account_id:
             matched_orders = _query_orders(account["account_id"], account["account_type"], {"order_id": order_id})
-            if matched_orders and not _filter_virtual_account_rows(matched_orders, payload):
+            if len(matched_orders) != 1 or not _filter_virtual_account_rows(matched_orders, payload):
                 return _error(
                     "VIRTUAL_ACCOUNT_MISMATCH",
                     "order %s does not belong to sub_account_id=%s" % (order_id, sub_account_id),
@@ -2766,6 +2985,26 @@ def _query_trade_detail_debug(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _dispatch_qmt_action(context_info: Any, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     request_id = payload.get("request_id")
+    if action in ("prepare_submission", "resolve_submission", "submission_reservations", "reject_submission"):
+        try:
+            if action == "prepare_submission":
+                result = _prepare_submission(context_info, payload)
+            elif action == "resolve_submission":
+                result = _resolve_submission(payload)
+            elif action == "submission_reservations":
+                result = _submission_reservations(payload)
+            else:
+                connection = _submission_db()
+                try:
+                    connection.execute("UPDATE submissions SET state='rejected', result=? WHERE account=? AND sub=? AND key=? AND state='prepared'", (json.dumps({"status": "rejected", "reason": payload.get("reason")}),) + _submission_identity(payload))
+                    result = _submission_result(_submission_row(connection, _submission_identity(payload)))
+                finally:
+                    connection.close()
+            return _ok(result, request_id)
+        except (ValueError, sqlite3.Error) as exc:
+            response = _error("IDEMPOTENCY_CONFLICT" if "IDEMPOTENCY_CONFLICT" in str(exc) else "SUBMISSION_REJECTED", str(exc), request_id)
+            response["broker_called"] = False
+            return response
     if action in ("snapshot", "current_tick", "live_current"):
         value = _get_full_tick(context_info, payload)
         if value.get("ok") is False and value.get("code"):
@@ -3000,6 +3239,7 @@ class _GatewayRuntime:
             log_file_size_bytes = 0
         return {
             "ready": context_ready,
+            "submission_protocol": SUBMISSION_PROTOCOL,
             "http_alive": self.ioloop is not None,
             "init_called": self.init_called,
             "context_ready": context_ready,
@@ -3186,6 +3426,10 @@ def _route_to_action(route: str, payload: Dict[str, Any]) -> Optional[str]:
         "/trades": "trades",
         "/order_status": "order_status",
         "/place_order": "place_order",
+        "/prepare_submission": "prepare_submission",
+        "/resolve_submission": "resolve_submission",
+        "/submission_reservations": "submission_reservations",
+        "/reject_submission": "reject_submission",
         "/cancel_order": "cancel_order",
         "/debug/trade_detail": "debug_trade_detail",
         "/debug/qmt_trade_detail": "debug_trade_detail",

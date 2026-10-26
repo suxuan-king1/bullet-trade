@@ -47,6 +47,37 @@ DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
 
 
+class RemoteRequestError(RuntimeError):
+    def __init__(self, message, code=None, broker_called=None, details=None):
+        super().__init__(message)
+        self.code = code
+        self.broker_called = broker_called
+        self.details = details or {}
+
+
+class SubmissionUnknownError(RemoteRequestError):
+    def __init__(self, payload, response=None):
+        super().__init__("下单提交状态未知 (submit_unknown)，请使用原幂等键重试或对账", "SUBMIT_UNKNOWN", details=response)
+        self.idempotency_key = payload["idempotency_key"]
+        self.request_payload = dict(payload)
+        self.order_id = (response or {}).get("order_id")
+
+    def resolve(self, broker):
+        payload = dict(self.request_payload)
+        return broker._client.request("broker.resolve_submission", {
+            **broker._base_payload(),
+            "idempotency_key": self.idempotency_key,
+            "write_action": "broker.place_order",
+            "request_payload": payload,
+        })
+
+    def retry(self, broker):
+        return broker._request_place_order(
+            "broker.place_order", dict(self.request_payload),
+            timeout=broker._resolve_place_order_rpc_timeout(self.request_payload.get("wait_timeout", 0)),
+        )
+
+
 class MarketOrderStyle:
     """聚宽风格市价单样式，可选保护价。"""
 
@@ -408,7 +439,7 @@ class RemoteBrokerClient:
         amount: int,
         price: Optional[float] = None,
         side: Optional[str] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         style: Optional[Any] = None,
         market: Optional[bool] = None,
@@ -455,7 +486,7 @@ class RemoteBrokerClient:
         security: str,
         value: float,
         price: Optional[float] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         style: Optional[Any] = None,
         side: Optional[str] = None,
@@ -509,7 +540,7 @@ class RemoteBrokerClient:
         security: str,
         percent: float,
         price: Optional[float] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         style: Optional[Any] = None,
         side: Optional[str] = None,
@@ -543,7 +574,7 @@ class RemoteBrokerClient:
         security: str,
         target: int,
         price: Optional[float] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         style: Optional[Any] = None,
         side: Optional[str] = None,
@@ -570,29 +601,21 @@ class RemoteBrokerClient:
         """
         _validate_jq_trade_scope(side=side, pindex=pindex, close_today=close_today)
         price, market = _resolve_price_market(price=price, style=style, market=market)
-        current = self._current_amount(security)
-        delta = target - current
-        if delta == 0:
-            return ""
-        return self.order(
-            security,
-            delta,
-            price=price,
-            side=side,
-            wait_timeout=wait_timeout,
-            style=style,
-            market=market,
-            remark=remark,
-            order_remark=order_remark,
-            idempotency_key=idempotency_key,
+        if int(target) != target or target < 0:
+            raise ValueError("target 必须为非负整数")
+        result = self._place_order(
+            security, max(1, int(target)), price, "BUY", wait_timeout,
+            market=market, remark=remark, order_remark=order_remark,
+            idempotency_key=idempotency_key, target_amount=int(target),
         )
+        return result.order_id
 
     def order_target_value(
         self,
         security: str,
         target_value: Optional[float] = None,
         price: Optional[float] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         value: Optional[float] = None,
         style: Optional[Any] = None,
@@ -651,7 +674,7 @@ class RemoteBrokerClient:
         security: str,
         percent: float,
         price: Optional[float] = None,
-        wait_timeout: float = 0,
+        wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
         *,
         style: Optional[Any] = None,
         side: Optional[str] = None,
@@ -754,7 +777,7 @@ class RemoteBrokerClient:
         orders = self.get_orders()
         if not orders:
             return {}
-        open_states = {"new", "submitted", "open", "filling", "canceling"}
+        open_states = {"new", "submitted", "open", "filling", "canceling", "partly_filled", "partially_filled", "pending_cancel"}
         return {oid: order for oid, order in orders.items() if str(order.status) in open_states}
 
     def get_trades(
@@ -781,9 +804,10 @@ class RemoteBrokerClient:
         payload["order_id"] = order_id
         return self._client.request("broker.order_status", payload)
 
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, order_id: str, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         payload = self._base_payload()
         payload["order_id"] = order_id
+        payload["idempotency_key"] = idempotency_key or self._make_idempotency_key(order_id, 0, "CANCEL", {})
         return self._client.request("broker.cancel_order", payload)
 
     def _build_order_snapshot(self, row: Dict[str, Any]) -> Optional[RemoteOrder]:
@@ -863,6 +887,7 @@ class RemoteBrokerClient:
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        target_amount: Optional[int] = None,
     ) -> RemoteOrder:
         """
         发送下单请求到服务端。
@@ -897,6 +922,8 @@ class RemoteBrokerClient:
                 "style": style,
                 "idempotency_key": idempotency_key or self._make_idempotency_key(security, amount, side, style),
             })
+            if target_amount is not None:
+                payload["target_amount"] = target_amount
             if wait_timeout is not None:
                 payload["wait_timeout"] = wait_timeout
             if effective_market:
@@ -919,7 +946,9 @@ class RemoteBrokerClient:
                         f"security={security}, amount={amount}, side={side}, error={exc}"
                     )
                     _log("ERROR", "[下单错误] {}", error_msg)
-                    raise RuntimeError(error_msg) from exc
+                    raise SubmissionUnknownError(payload) from exc
+                if not isinstance(exc, RemoteRequestError) or exc.broker_called is not False:
+                    raise SubmissionUnknownError(payload, getattr(exc, "details", None)) from exc
                 raise
             _log("DEBUG", "[下单] 收到下单响应: resp={}", resp)
             
@@ -932,6 +961,11 @@ class RemoteBrokerClient:
             actual_amount = resp.get("amount") if isinstance(resp, dict) else None
             actual_price = resp.get("price") if isinstance(resp, dict) else None
             
+            if isinstance(resp, dict) and (resp.get("submit_unknown") or resp.get("status") in {"submit_unknown", "reconciling"}):
+                raise SubmissionUnknownError(payload, resp)
+            if target_amount is not None and isinstance(resp, dict) and resp.get("status") == "no_op":
+                return RemoteOrder(order_id="", status="no_op", security=security, amount=0, price=price)
+
             # 检查订单 ID
             order_id = resp.get("order_id") if isinstance(resp, dict) else None
             if not order_id:
@@ -1200,6 +1234,8 @@ class _ShortLivedClient:
                         _log("INFO", "[RPC] [尝试 {}/{}] {}s 后重试...", attempt, attempts, self.retry_interval)
                         time.sleep(self.retry_interval)
                     continue
+                except RemoteRequestError:
+                    raise
                 except socket.timeout as e:
                     error_msg = f"连接超时: host={self.host}, port={self.port}, timeout=10s"
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
@@ -1320,8 +1356,19 @@ class _ShortLivedClient:
                             error_message = message.get("message", "server error")
                             _log("ERROR", "[RPC] [尝试 {}/{}] 服务器返回错误: message={}, payload={}", 
                                  attempt, attempts, error_message, error_payload)
-                            raise RuntimeError(f"服务器错误: {error_message}")
+                            raise RemoteRequestError(
+                                f"服务器错误: {error_message}",
+                                message.get("code") or error_payload.get("code"),
+                                error_payload.get("broker_called", message.get("broker_called")),
+                                error_payload,
+                            )
                             
+                except RemoteRequestError as exc:
+                    if exc.code in {"REQUEST_TIMEOUT", "BIG_QMT_GATEWAY_TIMEOUT", "BIG_QMT_GATEWAY_UNAVAILABLE", "GATEWAY_BUSY"} and attempt < attempts:
+                        last_error = exc
+                        time.sleep(self.retry_interval)
+                        continue
+                    raise
                 except socket.timeout as e:
                     error_msg = f"接收响应超时: timeout={effective_timeout}s"
                     _log("ERROR", "[RPC] [尝试 {}/{}] {}", attempt, attempts, error_msg)
@@ -1341,6 +1388,8 @@ class _ShortLivedClient:
                         time.sleep(self.retry_interval)
                     continue
                 
+            except RemoteRequestError:
+                raise
             except Exception as exc:
                 # 捕获所有其他未预期的异常
                 error_msg = f"未预期的异常: {exc}"
@@ -2007,8 +2056,8 @@ def install_jq_compat(
             target_value >= current_value,
         )
 
-    def compat_cancel_order(order_or_id: Any) -> Dict[str, Any]:
-        result = broker.cancel_order(_extract_order_id(order_or_id))
+    def compat_cancel_order(order_or_id: Any, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+        result = broker.cancel_order(_extract_order_id(order_or_id), idempotency_key=idempotency_key)
         cache.invalidate()
         return result
 
@@ -2046,7 +2095,7 @@ def order(
     amount: int,
     price: Optional[float] = None,
     side: Optional[str] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     style: Optional[Any] = None,
     market: Optional[bool] = None,
@@ -2072,7 +2121,7 @@ def order_value(
     security: str,
     value: float,
     price: Optional[float] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     style: Optional[Any] = None,
     side: Optional[str] = None,
@@ -2103,7 +2152,7 @@ def order_percent(
     security: str,
     percent: float,
     price: Optional[float] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     style: Optional[Any] = None,
     side: Optional[str] = None,
@@ -2134,7 +2183,7 @@ def order_target(
     security: str,
     target: int,
     price: Optional[float] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     style: Optional[Any] = None,
     side: Optional[str] = None,
@@ -2165,7 +2214,7 @@ def order_target_value(
     security: str,
     target_value: Optional[float] = None,
     price: Optional[float] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     value: Optional[float] = None,
     style: Optional[Any] = None,
@@ -2198,7 +2247,7 @@ def order_target_percent(
     security: str,
     percent: float,
     price: Optional[float] = None,
-    wait_timeout: float = 0,
+    wait_timeout: float = DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS,
     *,
     style: Optional[Any] = None,
     side: Optional[str] = None,
@@ -2225,8 +2274,8 @@ def order_target_percent(
     )
 
 
-def cancel_order(order_id: str) -> Dict[str, Any]:
-    return get_broker_client().cancel_order(order_id)
+def cancel_order(order_id: str, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+    return get_broker_client().cancel_order(order_id, idempotency_key=idempotency_key)
 
 
 def get_order_status(order_id: str) -> Dict[str, Any]:

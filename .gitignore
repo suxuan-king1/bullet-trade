@@ -211,3 +211,6 @@ logs/*
 # Big QMT helper runtime state
 artifacts/
 helpers/bt_big_qmt_order_tags.json
+
+
+.idea/

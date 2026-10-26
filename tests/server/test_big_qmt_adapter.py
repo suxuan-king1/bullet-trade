@@ -124,6 +124,11 @@ class _FakeGatewayClient:
         self.last_health = None
 
     async def post(self, path, payload=None, *, timeout_seconds=None):
+        if path == "/resolve_submission" and path not in self.responses:
+            return {"submission_state": "not_found"}
+        if path == "/prepare_submission" and path not in self.responses:
+            execution = dict(payload, _prepared=True)
+            return {"submission_state": "prepared", "execution": execution}
         self.calls.append(("POST", path, payload or {}))
         self.timeouts.append((path, timeout_seconds))
         value = self.responses[path]
@@ -141,7 +146,7 @@ class _FakeGatewayClient:
 
     async def health(self):
         self.calls.append(("GET", "/health", {}))
-        value = self.responses.get("/health", {"ready": True})
+        value = self.responses.get("/health", {"ready": True, "submission_protocol": "durable-submissions/v1"})
         if isinstance(value, Exception):
             raise value
         self.last_health = value
@@ -515,6 +520,7 @@ async def test_big_qmt_trading_and_cancel_forward_by_default():
     )
     cancel = await adapter.cancel_order(ctx, "O-default")
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["status"] == "submit_unknown"
     assert cancel["value"]["success"] is True
     assert client.calls[0][1] == "/place_order"
@@ -546,6 +552,7 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
     )
     cancel = await adapter.cancel_order(ctx, "O2")
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["status"] == "submit_unknown"
     assert cancel["value"]["value"] is True
     assert client.calls[0][1] == "/place_order"
@@ -588,6 +595,7 @@ async def test_big_qmt_server_account_identity_cannot_be_overridden_by_client_pa
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     submitted = client.calls[0][2]
     assert submitted["account_key"] == "default"
     assert submitted["account_id"] == "demo"
@@ -683,6 +691,7 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["order_id"] == "O-confirmed"
     assert order["status"] == "open"
     assert order["timed_out"] is False
@@ -761,6 +770,7 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["order_id"] == "O-new"
     assert order["qmt_user_order_id"] == "BT-new"
     assert order["order_remark"] == "sub:sub-a|bt:new"
@@ -818,6 +828,7 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["order_id"] == "O-ready"
     assert order["timed_out"] is False
     assert orders_calls >= 3
@@ -893,6 +904,7 @@ async def test_big_qmt_place_order_does_not_match_new_order_when_gateway_tag_is_
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["status"] == "submit_unknown"
 
 
@@ -926,6 +938,7 @@ async def test_big_qmt_place_order_returns_submit_unknown_when_not_visible():
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["status"] == "submit_unknown"
     assert order["timed_out"] is True
     assert order["async_tracking"] is True
@@ -981,6 +994,7 @@ async def test_big_qmt_confirmation_rejects_reverse_order_with_same_economic_fie
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["status"] == "submit_unknown"
     assert submission_identity["value"].startswith("BT-")
 
@@ -1007,7 +1021,7 @@ async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
         """
 
         submission_identity["value"] = payload["qmt_user_order_id"]
-        assert len(submission_identity["value"]) == 23
+        assert submission_identity["value"] == "BT-explicit-identity"
         return {"order_id": "", "passorder_return": 0}
 
     def _orders(_payload):
@@ -1059,12 +1073,13 @@ async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
             "style": {"type": "market", "protect_price": 120.0},
             "market_type": "opponent_best",
             "order_remark": "strategy-business-remark",
-            "qmt_user_order_id": "BT-explicit-identity-that-is-too-long",
+            "qmt_user_order_id": "BT-explicit-identity",
             "idempotency_key": "live-shape-confirmation",
             "wait_timeout": 0.05,
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert order["order_id"] == "5236"
     assert order["status"] == "filled"
     assert order["side"] == "BUY"
@@ -1118,6 +1133,7 @@ async def test_big_qmt_maps_canonical_market_type_to_native_pr_type(
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert client.calls[0][2]["pr_type"] == expected_pr_type
 
 
@@ -1146,6 +1162,7 @@ async def test_big_qmt_preserves_explicit_native_pr_type():
         },
     )
 
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert client.calls[0][2]["pr_type"] == 5
 
 
@@ -1237,6 +1254,7 @@ async def test_bigqmt_virtual_market_fill_with_only_customer_identity(duplicate,
             wait_timeout=0.02,
         ),
     )
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert result["status"] == ("submit_unknown" if duplicate else "filled")
     assert len([x for x in client.calls if x[1] == "/place_order"]) == 1
     if not duplicate:
@@ -1298,5 +1316,6 @@ async def test_bigqmt_confirmation_requires_unambiguous_broker_identity(identity
             wait_timeout=0.01,
         ),
     )
+    client.calls = [entry for entry in client.calls if entry[0] != "GET"]
     assert result["status"] == "submit_unknown"
     assert len([call for call in client.calls if call[1] == "/place_order"]) == 1

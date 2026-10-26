@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import ssl
 import time
@@ -35,6 +36,7 @@ from .adapters.base import (
 from .config import ServerConfig
 from .session import ClientSession
 from .tick import TickSubscriptionManager
+from .order_validation import normalize_order
 
 
 @dataclass
@@ -459,8 +461,15 @@ class ServerApplication:
                 sub_cfg.sub_account_id if sub_cfg else str(sub_account_id).split("@", 1)[0]
             )
         ctx = self.router.get(resolved_key)
+        resolved_key = ctx.config.key or "default"
+        if method in {"place_order", "cancel_order", "resolve_submission"}:
+            payload["account_key"] = resolved_key
+            if sub_account_id:
+                payload["sub_account_id"] = sub_cfg.sub_account_id if sub_cfg else str(sub_account_id).split("@", 1)[0]
         if method == "resolve_submission":
             return await self._resolve_submission(resolved_key, sub_cfg, ctx, payload)
+        if method == "place_order":
+            normalize_order(payload)
         write_action = f"broker.{method}" if method in {"place_order", "cancel_order"} else None
         if write_action is not None and self._idempotency_key_required:
             _validate_required_idempotency_key(payload)
@@ -468,9 +477,23 @@ class ServerApplication:
             _build_write_fingerprint(write_action, payload) if write_action is not None else None
         )
         if method == "place_order":
-            await self._maybe_reject_when_paused(payload)
-            await self._maybe_fill_price(payload)
-            await self.virtual_accounts.ensure_within_limit(sub_cfg, _estimate_order_value(payload))
+            preparer = getattr(self.adapters.broker_adapter, "prepare_order", None)
+            if payload.get("target_amount") is not None and not callable(preparer):
+                raise ValueError("当前后端不支持安全目标调仓")
+            if callable(preparer):
+                prepared = await preparer(ctx, payload)
+                if prepared.get("submission_state") != "prepared":
+                    return prepared
+                payload.update(prepared["execution"])
+            try:
+                await self._maybe_reject_when_paused(payload)
+                await self._maybe_fill_price(payload)
+                await self.virtual_accounts.ensure_within_limit(sub_cfg, _estimate_order_value(payload))
+            except Exception as exc:
+                rejecter = getattr(self.adapters.broker_adapter, "reject_prepared_order", None)
+                if callable(rejecter) and payload.get("_prepared"):
+                    await rejecter(ctx, payload, str(exc))
+                raise
         impl = method
         fn = getattr(self.adapters.broker_adapter, impl, None)
         if method == "cancel_order":
@@ -628,15 +651,48 @@ class ServerApplication:
                 total_value = _extract_total_value(account_info)
                 side = str(payload.get("side") or "BUY").upper()
                 action = "buy" if side == "BUY" else "sell"
-                risk.check_order(
-                    order_value=order_value,
-                    current_positions_count=positions_count,
-                    security=str(payload.get("security") or ""),
-                    total_value=total_value,
-                    action=action,
-                )
+                security = str(payload.get("security") or "")
+                current_value = sum(float(row.get("market_value") or (float(row.get("amount") or 0) * float(row.get("last_price") or payload.get("price") or 0))) for row in positions if row.get("security") == security)
+                orders = await self.adapters.broker_adapter.list_orders(ctx, {"security": security})
+                pending_value = 0.0
+                reserved_ids = set()
+                reservation_reader = getattr(self.adapters.broker_adapter, "submission_reservations", None)
+                if callable(reservation_reader):
+                    for reservation in await reservation_reader(ctx):
+                        if reservation.get("security") != security or reservation.get("side") != "BUY":
+                            continue
+                        if reservation.get("idempotency_key") == payload.get("idempotency_key") and reservation.get("sub_account_id", "") == payload.get("sub_account_id", ""):
+                            continue
+                        pending_value += float(reservation["amount"]) * float(reservation["price"])
+                        reserved_ids.add(reservation.get("qmt_user_order_id"))
+                for order in orders:
+                    if order.get("qmt_user_order_id") in reserved_ids or order.get("qmt_user_order_id") == payload.get("qmt_user_order_id") and payload.get("qmt_user_order_id"):
+                        continue
+                    if order.get("status") in {"filled", "cancelled", "canceled", "partly_canceled", "rejected"}:
+                        continue
+                    if str(order.get("side") or "").upper() == "BUY":
+                        remaining = max(0, float(order.get("amount") or 0) - float(order.get("filled") or 0))
+                        pending_value += remaining * float(order.get("order_price") or order.get("price") or payload.get("price") or 0)
+                try:
+                    if not all(math.isfinite(value) and value >= 0 for value in (order_value, current_value, pending_value, total_value)) or total_value <= 0:
+                        raise ValueError("风控缺少有效账户估值")
+                    risk.check_order(
+                        order_value=order_value,
+                        current_positions_count=positions_count,
+                        security=security,
+                        total_value=total_value,
+                        action=action,
+                        current_position_value=current_value,
+                        pending_buy_value=pending_value,
+                    )
+                except Exception as exc:
+                    rejecter = getattr(self.adapters.broker_adapter, "reject_prepared_order", None)
+                    if callable(rejecter) and payload.get("_prepared"):
+                        await rejecter(ctx, payload, str(exc))
+                    raise
                 result = await fn(*args)
-                risk.record_trade(order_value=order_value, action=action)
+                if not result.get("_replayed"):
+                    risk.record_trade(order_value=order_value, action=action)
                 return result
             return await fn(*args)
 
@@ -715,7 +771,7 @@ class ServerApplication:
         key = str(payload.get("idempotency_key") or "").strip()
         if not key:
             return None
-        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key)
+        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key, payload.get("sub_account_id"))
         normalized = fingerprint or _build_write_fingerprint(action, payload)
         async with self._idempotency_lock_guard:
             pending_result = _unknown_submission_result(
@@ -728,6 +784,8 @@ class ServerApplication:
             entry = self._idempotency_cache.get(cache_key)
             if entry is not None:
                 self._ensure_idempotency_match(entry, action, normalized, key)
+                if not entry.finalized and payload.get("_prepared") and getattr(self.adapters.broker_adapter, "durable_submissions", False):
+                    return None
                 return dict(entry.result)
             if len(self._idempotency_cache) >= self._idempotency_max_entries:
                 raise IdempotencyCapacityError("进程内幂等缓存已满；请先确认所有在途订单并在维护窗口安全重启服务")
@@ -772,7 +830,7 @@ class ServerApplication:
         key = str(payload.get("idempotency_key") or "").strip()
         if not key:
             return
-        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key)
+        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key, payload.get("sub_account_id"))
         normalized = fingerprint or _build_write_fingerprint(action, payload)
         normalized_result = dict(result) if isinstance(result, dict) else {"value": result}
         normalized_result.setdefault("idempotency_key", key)
@@ -820,10 +878,19 @@ class ServerApplication:
         original_payload = payload.get("request_payload") or {}
         if not isinstance(original_payload, dict):
             raise ValueError("request_payload 必须是对象")
+        if original_payload:
+            original_payload = dict(original_payload, account_key=ctx.config.key or "default")
+            if sub_cfg:
+                original_payload["sub_account_id"] = sub_cfg.sub_account_id
+            elif original_payload.get("sub_account_id"):
+                original_payload["sub_account_id"] = str(original_payload["sub_account_id"]).split("@", 1)[0]
+            if action == "broker.place_order":
+                normalize_order(original_payload)
+            payload = dict(payload, request_payload=original_payload)
         requested_fingerprint = (
             _build_write_fingerprint(action, original_payload) if original_payload else None
         )
-        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key)
+        cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key, payload.get("sub_account_id"))
         pending_result: Optional[Dict[str, Any]] = None
         async with self._idempotency_lock_guard:
             entry = self._idempotency_cache.get(cache_key)
@@ -846,6 +913,9 @@ class ServerApplication:
                     )
                 pending_result = dict(entry.result)
 
+        adapter_result = await self._resolve_with_adapter(ctx, payload)
+        if adapter_result:
+            return adapter_result
         strong_keys = {key}
         order_id = str(payload.get("order_id") or original_payload.get("order_id") or "").strip()
         matching_orders = await self._query_submission_orders(ctx, order_id, strong_keys)
@@ -979,6 +1049,7 @@ class ServerApplication:
         resolved_key: str,
         sub_cfg: Optional[SubAccountConfig],
         key: str,
+        sub_account_id: Optional[str] = None,
     ) -> Tuple[str, str, str]:
         """构造隔离父账户和虚拟子账户的缓存键。
 
@@ -991,7 +1062,7 @@ class ServerApplication:
             Tuple[str, str, str]: 进程内幂等缓存键。
         """
 
-        return (resolved_key, sub_cfg.sub_account_id if sub_cfg else "", key)
+        return (resolved_key, sub_cfg.sub_account_id if sub_cfg else str(sub_account_id or "").split("@", 1)[0], key)
 
     async def _maybe_fill_price(self, payload: Dict) -> None:
         """
@@ -1401,6 +1472,13 @@ def _build_write_fingerprint(action: str, payload: Dict[str, Any]) -> str:
                 "security": str(payload.get("security") or ""),
                 "side": str(payload.get("side") or "").upper(),
                 "amount": _safe_int(payload.get("amount") or payload.get("volume") or 0),
+                "price": payload.get("price"),
+                "pr_type": payload.get("pr_type"),
+                "target_amount": payload.get("target_amount"),
+                "qmt_user_order_id": payload.get("qmt_user_order_id"),
+                "quick_trade": payload.get("quick_trade"),
+                "strategy_name": payload.get("strategy_name"),
+                "order_remark": payload.get("order_remark"),
                 "style": {
                     "type": str(style.get("type") or "limit").lower(),
                     "market_type": str(

@@ -192,6 +192,8 @@ class AccountRouter:
     def get(self, key: Optional[str]) -> AccountContext:
         if key and key in self._accounts:
             return self._accounts[key]
+        if key:
+            raise KeyError(f"未知 account_key: {key}")
         if "default" in self._accounts:
             return self._accounts["default"]
         raise KeyError("未配置有效的 account_key")
@@ -238,7 +240,13 @@ class VirtualAccountManager:
                 mapped_parent = parent
         state = self._configs.get(actual_sub)
         if state:
+            if mapped_parent and mapped_parent != state.config.account_key:
+                raise ValueError("子账户父账户映射不一致")
             mapped_parent = state.config.account_key or mapped_parent
+        elif self._configs:
+            raise KeyError(f"未知 sub_account_id: {actual_sub}")
+        if mapped_parent and account_key and mapped_parent != account_key:
+            raise ValueError("account_key 与子账户父账户不一致")
         parent_key = mapped_parent or account_key or "default"
         cfg = state.config if state else None
         return parent_key, cfg

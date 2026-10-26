@@ -157,13 +157,13 @@ def _parse_allowlist(raw: Optional[str], *, strict: bool = False) -> List[str]:
 
     Args:
         raw: 逗号或分号分隔的 IP/CIDR。
-        strict: 遇到任一非法项时是否立即失败。
+        strict: 保留兼容参数；所有显式白名单均严格校验。
 
     Returns:
         List[str]: 规范化为显式前缀的网络列表；IPv6 单地址使用 /128。
 
     Raises:
-        ValueError: strict=True 且存在非法条目。
+        ValueError: 显式配置为空或存在非法条目。
     """
 
     result = []
@@ -181,8 +181,10 @@ def _parse_allowlist(raw: Optional[str], *, strict: bool = False) -> List[str]:
             result.append(network.with_prefixlen)
         except ValueError:
             invalid.append(item)
-    if strict and invalid:
-        raise ValueError("Huaxin server allowlist 含非法 IP/CIDR: " + ", ".join(invalid))
+    if invalid:
+        raise ValueError("server allowlist 含非法 IP/CIDR: " + ", ".join(invalid))
+    if raw is not None and not result:
+        raise ValueError("显式 allowlist 不能为空")
     return result
 
 
@@ -229,7 +231,9 @@ def build_server_config(args) -> ServerConfig:
         raise ValueError("TLS 配置不完整：证书和私钥必须同时提供")
     tls_enabled = bool(tls_cert and tls_key)
     tls = TLSConfig(enabled=tls_enabled, cert_path=tls_cert, key_path=tls_key)
-    allowlist_raw = getattr(args, "allowlist", None) or get_env("QMT_SERVER_ALLOWLIST")
+    allowlist_raw = getattr(args, "allowlist", None)
+    if allowlist_raw is None:
+        allowlist_raw = get_env("QMT_SERVER_ALLOWLIST")
     allowlist = _parse_allowlist(
         allowlist_raw,
         strict=huaxin_server and not _is_loopback_listener(listen),

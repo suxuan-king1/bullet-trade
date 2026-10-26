@@ -388,7 +388,8 @@ def test_runtime_health_reports_gateway_build_id():
 
     health = runtime.health()
 
-    assert helper.GATEWAY_BUILD_ID == "20260908_dividend_facts_v1"
+    assert helper.GATEWAY_BUILD_ID == "20261026_durable_submissions_v1"
+    assert health["submission_protocol"] == "durable-submissions/v1"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
 
 
@@ -991,9 +992,8 @@ def test_big_qmt_helper_accepts_article_order_payload(monkeypatch):
 
     monkeypatch.setattr(helper, "passorder", fake_passorder, raising=False)
 
-    response = helper._dispatch_qmt_action(
+    response = helper._place_order_native(
         _FakeContext(),
-        "place_order",
         {
             "stock": "000001.SZ",
             "volume": 100,
@@ -1033,9 +1033,8 @@ def test_big_qmt_helper_marks_zero_passorder_return_submit_unknown(monkeypatch, 
     helper.PENDING_ORDER_TAGS = []
     monkeypatch.setattr(helper, "passorder", lambda *args: 0, raising=False)
 
-    response = helper._dispatch_qmt_action(
+    response = helper._place_order_native(
         _FakeContext(),
-        "place_order",
         {
             "stock": "000001.SZ",
             "volume": 100,
@@ -1071,9 +1070,8 @@ def test_big_qmt_helper_allows_request_quick_trade_override(monkeypatch):
 
     monkeypatch.setattr(helper, "passorder", fake_passorder, raising=False)
 
-    response = helper._dispatch_qmt_action(
+    response = helper._place_order_native(
         _FakeContext(),
-        "place_order",
         {
             "stock": "000001.SZ",
             "volume": 100,
@@ -1105,9 +1103,8 @@ def test_big_qmt_helper_encodes_virtual_account_and_sends_qmt_user_order_id(monk
     helper.PENDING_ORDER_TAGS = []
     monkeypatch.setattr(helper, "passorder", fake_passorder, raising=False)
 
-    response = helper._dispatch_qmt_action(
+    response = helper._place_order_native(
         _FakeContext(),
-        "place_order",
         {
             "security": "000001.XSHE",
             "amount": 100,
@@ -1132,7 +1129,7 @@ def test_big_qmt_helper_encodes_virtual_account_and_sends_qmt_user_order_id(monk
     assert calls[0][9] == "QMT-USER-1"
 
 
-def test_big_qmt_helper_falls_back_to_article_passorder_signature_for_remark(monkeypatch, tmp_path):
+def test_big_qmt_helper_does_not_retry_after_signature_type_error(monkeypatch, tmp_path):
     helper = _load_helper()
     calls = []
 
@@ -1149,9 +1146,8 @@ def test_big_qmt_helper_falls_back_to_article_passorder_signature_for_remark(mon
     monkeypatch.setattr(helper, "PASSORDER_USE_REMARK_SIGNATURE", True)
     monkeypatch.setattr(helper, "passorder", fake_passorder, raising=False)
 
-    response = helper._dispatch_qmt_action(
+    response = helper._place_order_native(
         _FakeContext(),
-        "place_order",
         {
             "security": "000001.XSHE",
             "amount": 100,
@@ -1164,11 +1160,9 @@ def test_big_qmt_helper_falls_back_to_article_passorder_signature_for_remark(mon
         },
     )
 
-    assert response["ok"] is True
-    assert [len(item) for item in calls] == [11, 10]
-    assert calls[-1][7] == "qmt"
-    assert response["value"]["passorder_signature"] == "article"
-    assert response["value"]["passorder_fallback_error"] == "old passorder signature"
+    assert response["ok"] is False
+    assert response["code"] == "PLACE_ORDER_FAILED"
+    assert [len(item) for item in calls] == [11]
 
 
 def test_big_qmt_helper_filters_orders_and_trades_by_virtual_account(monkeypatch, tmp_path):
